@@ -1,28 +1,17 @@
 """
-SBI Bank Statement PDF to CSV Parser
+SBI Bank Statement PDF Parser
 
-Parses password-protected SBI savings account statements and maintains
-a single cumulative CSV for Google Sheets.
+Parses password-protected SBI savings account statements and returns
+structured transaction data.
 
 - Extracts table rows exactly as they appear in the PDF.
-- Existing data is never overwritten or duplicated (hash-based dedup).
-- New transactions are merged and sorted by date ascending.
-
-Usage:
-    python parse_sbi_statement.py statement.pdf
-    python parse_sbi_statement.py jan.pdf feb.pdf mar.pdf
-    python parse_sbi_statement.py                (auto-finds PDFs in Downloads)
-
-Output:  D:/finance/SBI_Transactions.csv  (single cumulative file)
+- Hash-based dedup key (SHA-256 of 5 financial fields).
 """
 
-import sys
-import csv
 import hashlib
 import re
-import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
+
 from dotenv import load_dotenv
 import os
 import pdfplumber
@@ -32,9 +21,6 @@ import pdfplumber
 # Config
 # ---------------------------------------------------------------------------
 
-DOWNLOADS_DIR = Path.home() / "Downloads"
-MASTER_CSV = Path(__file__).parent / "SBI_Transactions.csv"
-
 COL_TXN_DATE = 0
 COL_VALUE_DATE = 1
 COL_DESCRIPTION = 2
@@ -43,12 +29,6 @@ COL_DEBIT = 4
 COL_CREDIT = 5
 COL_BALANCE = 6
 MIN_COLS = 7
-
-CSV_FIELDS = [
-    "txn_id", "value_date", "post_date", "details", "ref_no",
-    "debit", "credit", "balance", "txn_type", "account_source",
-    "imported_at", "hash",
-]
 
 
 def load_password():
@@ -79,6 +59,7 @@ def is_date(text):
     if not text:
         return False
     try:
+        from datetime import datetime
         datetime.strptime(text.strip(), "%d/%m/%Y")
         return True
     except ValueError:
@@ -212,7 +193,7 @@ def parse_pdf(pdf_path, password):
 
 
 # ---------------------------------------------------------------------------
-# Hash, dedup, sort, CSV I/O
+# Hash
 # ---------------------------------------------------------------------------
 
 def compute_hash(txn):
@@ -223,152 +204,3 @@ def compute_hash(txn):
         txn["debit"], txn["credit"], txn["balance"],
     ])
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
-
-
-def parse_date_for_sort(date_str):
-    try:
-        return datetime.strptime(date_str, "%d/%m/%Y")
-    except (ValueError, TypeError):
-        return datetime.max
-
-
-def sort_key(txn):
-    """Sort by date ascending, then by PDF row order within each day."""
-    seq = txn.get("_parse_seq")
-    if seq is None:
-        try:
-            seq = int(txn.get("txn_id", 0))
-        except (ValueError, TypeError):
-            seq = 0
-    return (parse_date_for_sort(txn["post_date"]), seq)
-
-
-def load_existing_csv(path):
-    if not path.exists():
-        return [], set()
-    with open(path, "r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-    if rows:
-        missing = set(CSV_FIELDS) - set(rows[0].keys())
-        if missing:
-            raise RuntimeError(
-                f"Master CSV is missing columns: {missing}\n"
-                f"  Delete the CSV and re-run to regenerate."
-            )
-    hashes = {r["hash"] for r in rows if r.get("hash")}
-    return rows, hashes
-
-
-def write_master_csv(transactions, path):
-    """Sort, assign sequential txn_id, write CSV atomically."""
-    transactions.sort(key=sort_key)
-    for i, txn in enumerate(transactions, start=1):
-        txn["txn_id"] = i
-
-    path = Path(path)
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".csv.tmp")
-    try:
-        with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(transactions)
-        Path(tmp_path).replace(path)
-    except BaseException:
-        Path(tmp_path).unlink(missing_ok=True)
-        raise
-
-
-# ---------------------------------------------------------------------------
-# Main (CLI)
-# ---------------------------------------------------------------------------
-
-def find_sbi_pdfs():
-    return sorted(
-        [p for p in DOWNLOADS_DIR.glob("*.pdf") if "statement" in p.name.lower()],
-        key=lambda p: p.stat().st_mtime, reverse=True,
-    )
-
-
-def main():
-    try:
-        password = load_password()
-    except RuntimeError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-    if len(sys.argv) > 1:
-        pdf_paths = [Path(p) for p in sys.argv[1:]]
-    else:
-        pdf_paths = find_sbi_pdfs()
-        if not pdf_paths:
-            print("No statement PDFs found in Downloads.")
-            print("Usage: python parse_sbi_statement.py <pdf1> [pdf2] ...")
-            sys.exit(1)
-        print(f"Found {len(pdf_paths)} statement PDF(s) in {DOWNLOADS_DIR}:\n")
-
-    existing, existing_hashes = load_existing_csv(MASTER_CSV)
-    if existing:
-        print(f"Existing master CSV: {len(existing)} transactions\n")
-
-    all_new = []
-    seq_offset = len(existing)
-
-    for pdf_path in pdf_paths:
-        if not pdf_path.exists():
-            print(f"  SKIP: {pdf_path} (not found)")
-            continue
-
-        print(f"Parsing: {pdf_path.name}")
-        try:
-            transactions, stmt_from, stmt_to, pages = parse_pdf(str(pdf_path), password)
-        except RuntimeError as e:
-            print(f"  ERROR: {e}")
-            continue
-        except Exception as e:
-            print(f"  ERROR parsing {pdf_path.name}: {type(e).__name__}: {e}")
-            continue
-
-        if stmt_from and stmt_to:
-            print(f"  Period: {stmt_from} to {stmt_to}  ({pages} pages)")
-
-        new_count = 0
-        dup_count = 0
-        for txn in transactions:
-            h = compute_hash(txn)
-            if h in existing_hashes:
-                dup_count += 1
-            else:
-                txn["hash"] = h
-                txn["imported_at"] = now
-                txn["txn_id"] = 0
-                txn["_parse_seq"] = txn["_parse_seq"] + seq_offset
-                all_new.append(txn)
-                existing_hashes.add(h)
-                new_count += 1
-
-        print(f"  Found: {len(transactions)} total,  {new_count} new,  {dup_count} duplicates skipped\n")
-
-    if not all_new:
-        print("No new transactions to add.")
-        if existing:
-            print(f"Master CSV unchanged: {MASTER_CSV}")
-        return
-
-    merged = existing + all_new
-    write_master_csv(merged, MASTER_CSV)
-
-    total_dr = sum(float(t["debit"]) for t in merged if t["debit"])
-    total_cr = sum(float(t["credit"]) for t in merged if t["credit"])
-    print(f"{'=' * 50}")
-    print(f"Added {len(all_new)} new transactions")
-    print(f"Master CSV: {MASTER_CSV}")
-    print(f"  Total: {len(merged)}  |  Debits: {total_dr:,.2f}  |  Credits: {total_cr:,.2f}")
-
-    if merged:
-        print(f"  Date range: {merged[0]['post_date']} to {merged[-1]['post_date']}")
-
-
-if __name__ == "__main__":
-    main()
