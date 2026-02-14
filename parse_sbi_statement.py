@@ -8,13 +8,16 @@ structured transaction data.
 - Hash-based dedup key (SHA-256 of 5 financial fields).
 """
 
+import gc
 import hashlib
 import re
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
 import os
 import pdfplumber
+import pikepdf
 
 
 # ---------------------------------------------------------------------------
@@ -115,15 +118,57 @@ def clean_description(desc):
 # PDF parsing
 # ---------------------------------------------------------------------------
 
+BATCH_SIZE = 15  # pages per batch — keeps peak memory under ~300 MB
+
+
+def _extract_rows_from_pages(pdf):
+    """Extract transaction rows from all pages of an already-opened pdfplumber PDF."""
+    rows = []
+    for page in pdf.pages:
+        tables = page.extract_tables()
+        if not tables:
+            continue
+        for table in tables:
+            if not table:
+                continue
+            for row in table:
+                if not row:
+                    continue
+                if is_summary_row(row):
+                    continue
+                if not is_transaction_row(row):
+                    continue
+
+                desc_raw = row[COL_DESCRIPTION] or ""
+                debit = parse_amount(row[COL_DEBIT])
+                credit = parse_amount(row[COL_CREDIT])
+                balance = parse_amount(row[COL_BALANCE])
+
+                if not debit and not credit and not balance:
+                    continue
+
+                rows.append({
+                    "value_date": (row[COL_VALUE_DATE] or "").strip(),
+                    "post_date": (row[COL_TXN_DATE] or "").strip(),
+                    "details": clean_description(desc_raw),
+                    "ref_no": extract_ref_number(desc_raw),
+                    "debit": debit,
+                    "credit": credit,
+                    "balance": balance,
+                    "txn_type": "debit" if debit else "credit" if credit else "",
+                    "account_source": "sbi_email",
+                })
+    return rows
+
+
 def parse_pdf(pdf_path, password):
     """Parse all transaction rows from an SBI statement PDF.
 
-    Returns list of dicts, one per table row, exactly as extracted.
+    Processes pages in batches via pikepdf to keep memory under control
+    for large (100+ page) statements.
     """
-    transactions = []
-
     try:
-        pdf = pdfplumber.open(pdf_path, password=password)
+        source = pikepdf.open(pdf_path, password=password)
     except Exception as e:
         err_str = str(e).lower()
         if "password" in err_str or "decrypt" in err_str or "encrypted" in err_str:
@@ -133,61 +178,54 @@ def parse_pdf(pdf_path, password):
             ) from e
         raise
 
-    with pdf:
-        page_count = len(pdf.pages)
+    with source:
+        page_count = len(source.pages)
         if page_count == 0:
             raise RuntimeError(f"PDF has no pages: {pdf_path}")
 
-        first_page_text = pdf.pages[0].extract_text() or ""
-        if not re.search(r"State Bank|SBI|Account\s*Number", first_page_text, re.IGNORECASE):
-            raise RuntimeError(
-                f"This doesn't look like an SBI statement: {pdf_path}\n"
-                f"  First page has no SBI/State Bank header."
-            )
+        # --- Validate first page and extract statement period ---
+        fd, tmp_first = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        try:
+            first_pdf = pikepdf.new()
+            first_pdf.pages.append(source.pages[0])
+            first_pdf.save(tmp_first)
+            first_pdf.close()
 
-        stmt_from, stmt_to = extract_statement_period(pdf)
-        seq = 0
+            with pdfplumber.open(tmp_first) as pdf:
+                first_text = pdf.pages[0].extract_text() or ""
+                if not re.search(r"State Bank|SBI|Account\s*Number", first_text, re.IGNORECASE):
+                    raise RuntimeError(
+                        f"This doesn't look like an SBI statement: {pdf_path}\n"
+                        f"  First page has no SBI/State Bank header."
+                    )
+                stmt_from, stmt_to = extract_statement_period(pdf)
+        finally:
+            Path(tmp_first).unlink(missing_ok=True)
 
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            if not tables:
-                continue
-            for table in tables:
-                if not table:
-                    continue
-                for row in table:
-                    if not row:
-                        continue
-                    if is_summary_row(row):
-                        continue
-                    if not is_transaction_row(row):
-                        continue
+        # --- Process pages in batches ---
+        transactions = []
 
-                    desc_raw = row[COL_DESCRIPTION] or ""
-                    post_date = (row[COL_TXN_DATE] or "").strip()
-                    value_date = (row[COL_VALUE_DATE] or "").strip()
-                    debit = parse_amount(row[COL_DEBIT])
-                    credit = parse_amount(row[COL_CREDIT])
-                    balance = parse_amount(row[COL_BALANCE])
+        for batch_start in range(0, page_count, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, page_count)
 
-                    if not debit and not credit and not balance:
-                        continue
+            fd, tmp_batch = tempfile.mkstemp(suffix=".pdf")
+            os.close(fd)
+            try:
+                batch_pdf = pikepdf.new()
+                for i in range(batch_start, batch_end):
+                    batch_pdf.pages.append(source.pages[i])
+                batch_pdf.save(tmp_batch)
+                batch_pdf.close()
 
-                    txn_type = "debit" if debit else "credit" if credit else ""
+                with pdfplumber.open(tmp_batch) as pdf:
+                    transactions.extend(_extract_rows_from_pages(pdf))
+            finally:
+                Path(tmp_batch).unlink(missing_ok=True)
+                gc.collect()
 
-                    transactions.append({
-                        "value_date": value_date,
-                        "post_date": post_date,
-                        "details": clean_description(desc_raw),
-                        "ref_no": extract_ref_number(desc_raw),
-                        "debit": debit,
-                        "credit": credit,
-                        "balance": balance,
-                        "txn_type": txn_type,
-                        "account_source": "sbi_email",
-                        "_parse_seq": seq,
-                    })
-                    seq += 1
+        for seq, txn in enumerate(transactions):
+            txn["_parse_seq"] = seq
 
     return transactions, stmt_from, stmt_to, page_count
 
