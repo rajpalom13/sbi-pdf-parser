@@ -140,6 +140,7 @@ def _extract_rows_from_pages(pdf):
                     continue
 
                 desc_raw = row[COL_DESCRIPTION] or ""
+                cheque_raw = (row[COL_CHEQUE_NO] or "").strip()
                 debit = parse_amount(row[COL_DEBIT])
                 credit = parse_amount(row[COL_CREDIT])
                 balance = parse_amount(row[COL_BALANCE])
@@ -152,6 +153,7 @@ def _extract_rows_from_pages(pdf):
                     "post_date": (row[COL_TXN_DATE] or "").strip(),
                     "details": clean_description(desc_raw),
                     "ref_no": extract_ref_number(desc_raw),
+                    "cheque_no": cheque_raw if cheque_raw != "-" else "",
                     "debit": debit,
                     "credit": credit,
                     "balance": balance,
@@ -235,10 +237,13 @@ def parse_pdf(pdf_path, password):
 # ---------------------------------------------------------------------------
 
 def compute_hash(txn):
-    """SHA-256 of 5 financial fields. Balance is a running total so
-    even same-amount transactions on the same day produce unique hashes."""
+    """SHA-256 of financial fields + description for uniqueness.
+    Includes details because different transactions can share the same
+    date, amount, and balance (e.g. two UPI credits of the same amount
+    on the same day that restore the same balance)."""
     raw = "|".join([
         txn["post_date"], txn["value_date"],
         txn["debit"], txn["credit"], txn["balance"],
+        txn.get("details", ""),
     ])
     return hashlib.sha256(raw.encode()).hexdigest()[:32]

@@ -68,6 +68,7 @@ def _txn_to_dict(txn):
         "post_date": txn.get("post_date", ""),
         "details": txn.get("details", ""),
         "ref_no": txn.get("ref_no", ""),
+        "cheque_no": txn.get("cheque_no", ""),
         "debit": txn.get("debit", ""),
         "credit": txn.get("credit", ""),
         "balance": txn.get("balance", ""),
